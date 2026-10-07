@@ -136,7 +136,6 @@ tr:last-child td{border-bottom:none}
       <span class="topbar-lbl" id="conn-lbl">&#8212;</span>
       <span class="topbar-lbl" id="refresh-countdown" style="color:var(--text3)"></span>
       <button class="btn" style="padding:5px 12px;font-size:12px" onclick="caricaDati()">&#8635;</button>
-      <button class="btn" style="padding:5px 12px;font-size:12px" onclick="reindex()" title="Ricostruisci indice da Drive">🔧</button>
       <button class="btn" style="padding:5px 12px;font-size:12px" onclick="apriGestioneOperai()">👷 Operai</button>
     </div>
   </div>
@@ -246,7 +245,7 @@ tr:last-child td{border-bottom:none}
     </div>
     <div style="margin-top:16px;display:flex;justify-content:flex-end;gap:8px">
       <button class="btn" onclick="chiudiModifica()">Annulla</button>
-      <button class="btn btn-accent" onclick="salvaModifica()">💾 Salva e aggiorna su Drive</button>
+      <button class="btn btn-accent" onclick="salvaModifica()">💾 Salva e aggiorna</button>
     </div>
   </div>
 </div>
@@ -274,12 +273,138 @@ tr:last-child td{border-bottom:none}
 </div>
 
 <script>
-var SCRIPT_URL    = 'https://script.google.com/macros/s/AKfycbxwM3SXUM9GioLOcnFoYGwj6lk7JMhwnVvcUW-IwqE_nrd_vZjHApdijXwXHcZSAG2s/exec';
-var DASH_PASSWORD = 'Tcsistem2026!';
+// ═══ CONNESSIONE AL DATABASE (Supabase) ═══════════════════════════
+const SB_URL = 'https://unytdhjxgbspchydgure.supabase.co';     // es. https://abcdefgh.supabase.co
+const SB_KEY = 'sb_publishable_ruAKvyaspLMpSy18ZA5oyw_Yu5JxGc6';      // chiave "anon" / "publishable" (è pubblica per progetto)
+const DASH_EMAIL = 'amministrazione@tcsistem.it';
+const SCRIPT_URL = SB_URL;
+var sbSess = null;
+try { sbSess = JSON.parse(sessionStorage.getItem('sb_sess') || 'null'); } catch(e) {}
+function sbSalvaSess(s) { sbSess = s; try { if (s) sessionStorage.setItem('sb_sess', JSON.stringify(s)); else sessionStorage.removeItem('sb_sess'); } catch(e) {} }
+async function sbRaw(path, o) {
+  o = o || {};
+  var h = { 'apikey': SB_KEY, 'Content-Type': 'application/json' };
+  if (o.token) h['Authorization'] = 'Bearer ' + o.token;
+  else if (SB_KEY.indexOf('eyJ') === 0) h['Authorization'] = 'Bearer ' + SB_KEY;
+  for (var k in (o.headers || {})) h[k] = o.headers[k];
+  var res = await fetch(SB_URL + path, { method: o.method || 'GET', headers: h, signal: o.signal,
+    body: o.body !== undefined ? JSON.stringify(o.body) : undefined });
+  var txt = await res.text(), data = null;
+  try { data = txt ? JSON.parse(txt) : null; } catch(e) {}
+  if (!res.ok) {
+    var err = new Error((data && (data.message || data.msg || data.error_description || data.error)) || ('errore ' + res.status));
+    err.http = true; err.status = res.status; throw err;
+  }
+  return data;
+}
+async function sbToken() {
+  if (!sbSess) return null;
+  if (sbSess.expires_at - 60 > Date.now() / 1000) return sbSess.access_token;
+  try {
+    var d = await sbRaw('/auth/v1/token?grant_type=refresh_token', { method: 'POST', body: { refresh_token: sbSess.refresh_token } });
+    sbSalvaSess({ access_token: d.access_token, refresh_token: d.refresh_token, expires_at: d.expires_at || (Date.now() / 1000 + d.expires_in) });
+    return sbSess.access_token;
+  } catch(e) { if (e.http) sbSalvaSess(null); throw e; }
+}
+async function sbLogin(password) {
+  var d = await sbRaw('/auth/v1/token?grant_type=password', { method: 'POST', body: { email: DASH_EMAIL, password: password } });
+  sbSalvaSess({ access_token: d.access_token, refresh_token: d.refresh_token, expires_at: d.expires_at || (Date.now() / 1000 + d.expires_in) });
+}
+async function sbApi(path, o) { o = o || {}; o.token = await sbToken(); return sbRaw(path, o); }
+function sbRpc(nome, args, o) { o = o || {}; o.method = 'POST'; o.body = args || {}; return sbApi('/rest/v1/rpc/' + nome, o); }
+var sbCfg = null;
+async function sbConfig() {
+  if (sbCfg) return sbCfg;
+  var righe = await sbApi('/rest/v1/impostazioni?select=chiave,valore'), c = {};
+  righe.forEach(function(r) { c[r.chiave] = r.valore; });
+  sbCfg = { azienda: c.azienda || '', piva: c.piva || '', tel: c.tel || '', email: c.email || '', logo: c.logo || '' };
+  return sbCfg;
+}
+async function sbOperai() {
+  var righe = await sbApi('/rest/v1/operai?select=nome&order=pos.asc,id.asc');
+  return righe.map(function(r) { return r.nome; });
+}
+function sbRiga(x) {
+  return { fileId: String(x.id), numero: x.numero || '', data: x.data || '', cliente: x.cliente || '', commessa: String(x.commessa || ''),
+    tecnico: x.tecnico || '', tipo: x.tipo || '', stato: x.stato || '0',
+    totLav: Number(x.tot_lav) || 0, totStr: Number(x.tot_str) || 0, totSab: Number(x.tot_sab) || 0,
+    totFest: Number(x.tot_fest) || 0, totViag: Number(x.tot_viag) || 0, firmato: !!x.firmato };
+}
+async function sbMail(corpo) {
+  var tok = await sbToken();
+  var h = { 'apikey': SB_KEY, 'Content-Type': 'application/json' };
+  if (tok) h['Authorization'] = 'Bearer ' + tok;
+  var res = await fetch(SB_URL + '/functions/v1/rapportini-mail', { method: 'POST', headers: h, body: JSON.stringify(corpo) });
+  var d = null; try { d = await res.json(); } catch(e) {}
+  if (!res.ok || !d || !d.ok) { var er = new Error((d && d.error) || ('errore ' + res.status)); er.http = true; throw er; }
+  return d;
+}
+// Gestisce le richieste dell'app come faceva il vecchio server: stesse azioni, stesse risposte.
+async function sbGestisci(url, opts) {
+  var q = new URLSearchParams(url.indexOf('?') >= 0 ? url.substring(url.indexOf('?') + 1) : '');
+  var azione = q.get('action') || '', post = null;
+  if (opts && opts.body) { try { post = JSON.parse(opts.body); } catch(e) {} }
+  var sig = opts && opts.signal;
+  if (post) {
+    if (post._action === 'saveOperai') { await sbRpc('rap_salva_operai', { nomi: post.operai || [] }); return { ok: true }; }
+    if (post._action === 'elimina') {
+      var del = await sbApi('/rest/v1/rapportini?id=eq.' + String(post.fileId || '').replace(/\D/g, ''), { method: 'DELETE', headers: { 'Prefer': 'return=representation' } });
+      if (!del || !del.length) return { ok: false, error: 'Rapportino non trovato o accesso non autorizzato' };
+      return { ok: true };
+    }
+    if (post._action === 'verifica') {
+      var pres = await sbRpc('rap_verifica', { numeri: post.numeri || [] }, { signal: sig });
+      return { ok: true, rapportini: (pres || []).map(function(n) { return { numero: n }; }) };
+    }
+    if (post._action === 'sendMail') { await sbMail({ tipo: 'cliente', to: post.to, rapportino: post.rapportino }); return { ok: true }; }
+    if (post._action === 'sendIdea') { await sbMail({ tipo: 'idea', nome: post.nome, testo: post.testo }); return { ok: true }; }
+    return await sbRpc('rap_salva', { r: post }, { signal: sig });
+  }
+  if (azione === 'ping') { await sbConfig(); return { ok: true, msg: 'Database collegato' }; }
+  if (azione === 'config') { var c = await sbConfig(); var o = await sbOperai(); return Object.assign({ ok: true, operai: o }, c); }
+  if (azione === 'nextnum') { return { ok: true, numero: await sbRpc('rap_next_numero') }; }
+  if (azione === 'operai') { return { ok: true, operai: await sbOperai() }; }
+  if (azione === 'reindex') { return { ok: true, msg: 'Non serve: i dati sono in un database SQL.' }; }
+  if (azione === 'list') {
+    var tutti = [], da = 0, passo = 1000;
+    while (true) {
+      var pag = await sbApi('/rest/v1/rapportini?select=id,numero,data,cliente,commessa,tecnico,tipo,stato,tot_lav,tot_str,tot_sab,tot_fest,tot_viag,firmato&order=data.desc.nullslast,id.desc',
+        { headers: { 'Range-Unit': 'items', 'Range': da + '-' + (da + passo - 1) } });
+      tutti = tutti.concat(pag);
+      if (pag.length < passo) break;
+      da += passo;
+    }
+    return { ok: true, rapportini: tutti.map(sbRiga) };
+  }
+  if (azione === 'get') {
+    var id = String(q.get('fileId') || '').replace(/\D/g, '');
+    if (!id) return { ok: false, error: 'fileId non valido' };
+    var rr = await sbApi('/rest/v1/rapportini?id=eq.' + id + '&select=*');
+    if (!rr.length) return { ok: false, error: 'Rapportino non trovato' };
+    var x = rr[0], cf = await sbConfig();
+    return { ok: true, rapportino: Object.assign({ id: x.client_id || String(x.id), numero: x.numero || '', data: x.data || '', cliente: x.cliente || '',
+      commessa: String(x.commessa || ''), indirizzo: x.indirizzo || '', tecnico: x.tecnico || '', tipo: x.tipo || '', stato: x.stato || '0',
+      descrizione: x.descrizione || '', note: x.note || '', totLav: Number(x.tot_lav) || 0, totStr: Number(x.tot_str) || 0, totSab: Number(x.tot_sab) || 0,
+      totFest: Number(x.tot_fest) || 0, totViag: Number(x.tot_viag) || 0, materiali: x.materiali || [], operai: x.operai || [], firme: x.firme || {},
+      firmato: !!x.firmato, syncedAt: x.synced_at || '', createdAt: x.created_at || '', driveFileId: String(x.id) }, cf) };
+  }
+  return { ok: false, error: 'azione sconosciuta' };
+}
+// Sostituisce fetch(SCRIPT_URL…) nel resto dell'app: restituisce un oggetto "come una risposta di rete"
+async function apiFetch(url, opts) {
+  var d;
+  try { d = await sbGestisci(url, opts); }
+  catch(e) { if (e && e.http) d = { ok: false, error: e.message }; else throw e; }
+  var txt = JSON.stringify(d);
+  return { ok: true, status: 200, text: async function() { return txt; }, json: async function() { return d; } };
+}
+// ═══════════════════════════════════════════════════════════════════
 var REFRESH_MIN   = 210;
 var tutti = [], filtrati = [], rapCorrente = null, charts = {};
 var refreshTimer = null, countdownTimer = null, secondiRimasti = 0;
-function doLogin(){var p=document.getElementById('pwd').value;if(p===DASH_PASSWORD){document.getElementById('login-screen').style.display='none';document.getElementById('app').classList.add('visible');caricaDati();avviaAutoRefresh();}else{document.getElementById('pwd-err').classList.add('show');document.getElementById('pwd').value='';}}
+function entraDashboard(){document.getElementById('login-screen').style.display='none';document.getElementById('app').classList.add('visible');caricaDati();avviaAutoRefresh();}
+async function doLogin(){var p=document.getElementById('pwd').value;var er=document.getElementById('pwd-err');try{await sbLogin(p);entraDashboard();}catch(e){er.textContent=e.http?'Password non corretta.':'Connessione non riuscita. Riprova.';er.classList.add('show');document.getElementById('pwd').value='';}}
+if(sbSess){entraDashboard();}
 document.getElementById('pwd').addEventListener('keydown',function(e){if(e.key==='Enter')doLogin();});
 function el(id){return document.getElementById(id)}
 function esc(s){if(!s)return'';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
@@ -299,7 +424,7 @@ var _at;
 function showAlert(msg,type){var a=el('alert');a.className='alert alert-'+type+' show';a.textContent=msg;clearTimeout(_at);_at=setTimeout(function(){a.classList.remove('show')},5000)}
 function avviaAutoRefresh(){if(refreshTimer)clearInterval(refreshTimer);if(countdownTimer)clearInterval(countdownTimer);secondiRimasti=REFRESH_MIN*60;aggiornaCountdown();countdownTimer=setInterval(function(){secondiRimasti--;if(secondiRimasti<0)secondiRimasti=REFRESH_MIN*60;aggiornaCountdown()},1000);refreshTimer=setInterval(function(){secondiRimasti=REFRESH_MIN*60;caricaDati()},REFRESH_MIN*60*1000);}
 function aggiornaCountdown(){var ore=Math.floor(secondiRimasti/3600),min=Math.floor((secondiRimasti%3600)/60),sec=secondiRimasti%60;var l=el('refresh-countdown');if(l)l.textContent='Agg. in '+(ore>0?ore+'h ':'')+String(min).padStart(2,'0')+'m '+String(sec).padStart(2,'0')+'s';}
-async function caricaDati(){el('conn-dot').className='conn-dot spin';el('conn-lbl').textContent='Caricamento...';try{var res=await fetch(SCRIPT_URL+'?action=list&_dc='+Date.now());var d=await res.json();if(!d.ok)throw new Error(d.error);tutti=d.rapportini||[];el('conn-dot').className='conn-dot ok';el('conn-lbl').textContent='Connesso — '+tutti.length+' rapportini';aggiornaFiltri();}catch(e){el('conn-dot').className='conn-dot err';el('conn-lbl').textContent='Errore';showAlert('Errore: '+e.message,'err')}}
+async function caricaDati(){el('conn-dot').className='conn-dot spin';el('conn-lbl').textContent='Caricamento...';try{var res=await apiFetch(SCRIPT_URL+'?action=list&_dc='+Date.now());var d=await res.json();if(!d.ok)throw new Error(d.error);tutti=d.rapportini||[];el('conn-dot').className='conn-dot ok';el('conn-lbl').textContent='Connesso — '+tutti.length+' rapportini';aggiornaFiltri();}catch(e){el('conn-dot').className='conn-dot err';el('conn-lbl').textContent='Errore';showAlert('Errore: '+e.message,'err')}}
 function resetFiltri(){['f-da','f-a','f-tecnico','f-cliente','f-commessa'].forEach(function(id){el(id).value=''});el('f-stato').value='';aggiornaFiltri()}
 function aggiornaFiltri(){var da=el('f-da').value,a=el('f-a').value;var te=el('f-tecnico').value.toLowerCase().trim();var cl=el('f-cliente').value.toLowerCase().trim();var co=el('f-commessa').value.toLowerCase().trim();var st=el('f-stato').value;filtrati=tutti.filter(function(r){if(da&&r.data&&r.data<da)return false;if(a&&r.data&&r.data>a)return false;if(te&&!(r.tecnico||'').toLowerCase().includes(te))return false;if(cl&&!(r.cliente||'').toLowerCase().includes(cl))return false;if(co&&!(r.commessa||'').toLowerCase().includes(co))return false;if(st==='100'&&parseInt(r.stato)!==100)return false;if(st==='<100'&&parseInt(r.stato)>=100)return false;return true;});aggiornaKPI();aggiornaGrafici();aggiornaTabella();}
 function aggiornaKPI(){var tL=filtrati.reduce(function(s,r){return s+(r.totLav||0)},0);var tV=filtrati.reduce(function(s,r){return s+(r.totViag||0)},0);var tS=filtrati.reduce(function(s,r){return s+(r.totStr||0)},0);el('kpi-tot').textContent=filtrati.length;el('kpi-lav').textContent=fmt(tL);el('kpi-viag').textContent=fmt(tV);el('kpi-str').textContent=fmt(tS);
@@ -342,14 +467,14 @@ function segnaVisualizzato(fileId){if(!fileId)return;var s=getVistiSet();if(s.ha
 function segnaStampato(fileId){if(!fileId)return;var s=getStampatiSet();s.add(fileId);localStorage.setItem('dash_stampati_v1',JSON.stringify(Array.from(s)));var v=getVistiSet();if(!v.has(fileId)){v.add(fileId);localStorage.setItem('dash_visti_v1',JSON.stringify(Array.from(v)))}aggiornaTabella()}
 
 function aggiornaTabella(){el('table-count').textContent=filtrati.length+' rapportini';var tbody=el('tbody');tbody.innerHTML='';if(!filtrati.length){var e=document.createElement('tr');e.innerHTML='<td colspan="10" class="empty-table">Nessun rapportino nel periodo selezionato</td>';tbody.appendChild(e);return}var sett={},keys=[];filtrati.forEach(function(r){var k=wKey(r.data),s=wSort(r.data);if(!sett[k]){sett[k]={sort:s,rows:[],tL:0,tV:0,tS:0};keys.push(k)}sett[k].rows.push(r);sett[k].tL+=r.totLav||0;sett[k].tV+=r.totViag||0;sett[k].tS+=r.totStr||0});keys.sort(function(a,b){return sett[b].sort.localeCompare(sett[a].sort)});keys.forEach(function(key,ki){var s=sett[key],isFirst=ki===0;var hdr=document.createElement('tr');hdr.style.cssText='background:var(--surface2);cursor:pointer;user-select:none';(function(k){hdr.addEventListener('click',function(){toggleSett(k)})})(key);var td=document.createElement('td');td.setAttribute('colspan','10');td.style.cssText='padding:11px 16px;font-size:11px;font-family:var(--mono);text-transform:uppercase;letter-spacing:.08em;color:var(--text2);border-bottom:1px solid var(--border2)';var arr=document.createElement('span');arr.textContent=isFirst?'▼':'▶';arr.style.cssText='margin-right:10px;color:var(--text3)';arr.dataset.wh=key;td.appendChild(arr);td.innerHTML+='<span style="color:var(--text);font-weight:500">'+esc(key)+'</span>'+'<span style="margin-left:16px">Lav: <strong style="color:#2d6a2d">'+fN(s.tL)+'h</strong></span>'+'<span style="margin-left:10px">Viag: <strong style="color:#1a4a7a">'+fN(s.tV)+'h</strong></span>'+'<span style="margin-left:10px">Straord: <strong style="color:#c07000">'+fN(s.tS)+'h</strong></span>'+'<span style="margin-left:10px;color:var(--text3)">'+s.rows.length+' rapportini</span>';hdr.appendChild(td);tbody.appendChild(hdr);var vistiSet=getVistiSet(),stampatiSet=getStampatiSet();s.rows.forEach(function(r){var pct=parseInt(r.stato)||0;var badge=pct===100?'<span class="badge b-ok">100%</span>':pct>=50?'<span class="badge b-mid">'+pct+'%</span>':'<span class="badge b-low">'+pct+'%</span>';var firma=r.firmato?'<span class="badge b-ok" style="margin-left:4px">Firmato</span>':'';var fid=r.fileId||'';var stampato=stampatiSet.has(fid),visto=vistiSet.has(fid);var statoIcona=stampato?'<span title="Stampato" style="margin-left:6px">🖨️</span>':(visto?'<span title="Visualizzato" style="margin-left:6px">👁️</span>':'');var tr=document.createElement('tr');tr.style.cursor='pointer';tr.style.display=isFirst?'':'none';tr.dataset.week=key;tr.dataset.id=fid;if(stampato){tr.style.background='#eef7ee'}else if(visto){tr.style.background='#f7f6f2'}(function(id){tr.addEventListener('click',function(){apriDettaglio(id)})})(fid);tr.innerHTML='<td style="font-family:var(--mono);color:#2d6a2d;font-size:12px">'+esc(r.numero||'—')+'</td>'+'<td style="font-family:var(--mono);font-size:12px">'+fmtData(r.data)+'</td>'+'<td style="font-weight:500">'+esc(r.cliente||'—')+'</td>'+'<td style="font-family:var(--mono);font-size:12px">'+esc(r.commessa||'—')+'</td>'+'<td>'+esc(r.tecnico||'—')+'</td>'+'<td style="color:var(--text2)">'+esc(r.tipo||'—')+'</td>'+'<td style="text-align:right;font-family:var(--mono);color:#1a4a7a">'+fN(r.totLav||0)+'h</td>'+'<td style="text-align:right;font-family:var(--mono);color:var(--text2)">'+fN(r.totViag||0)+'h</td>'+'<td style="text-align:right;font-family:var(--mono);color:#c07000">'+fN(r.totStr||0)+'h</td>'+'<td>'+badge+firma+statoIcona+'</td>';tbody.appendChild(tr);});}); }
-async function apriDettaglio(fileId){if(!fileId)return;try{var res=await fetch(SCRIPT_URL+'?action=get&fileId='+encodeURIComponent(fileId)+'&_dc='+Date.now());var d=await res.json();if(!d.ok)throw new Error(d.error);rapCorrente=d.rapportino;rapCorrente.driveFileId=fileId;mostraModale(rapCorrente);segnaVisualizzato(fileId)}catch(e){showAlert('Errore: '+e.message,'err')}}
+async function apriDettaglio(fileId){if(!fileId)return;try{var res=await apiFetch(SCRIPT_URL+'?action=get&fileId='+encodeURIComponent(fileId)+'&_dc='+Date.now());var d=await res.json();if(!d.ok)throw new Error(d.error);rapCorrente=d.rapportino;rapCorrente.driveFileId=fileId;mostraModale(rapCorrente);segnaVisualizzato(fileId)}catch(e){showAlert('Errore: '+e.message,'err')}}
 
 async function eliminaRapportinoCorrente(){
   if(!rapCorrente||!rapCorrente.driveFileId)return;
   var etichetta='N. '+(rapCorrente.numero||'—')+' — '+(rapCorrente.cliente||'—')+' del '+fmtData(rapCorrente.data);
   if(!confirm('Eliminare definitivamente questo rapportino?\n\n'+etichetta+'\n\nQuesta operazione non è reversibile.'))return;
   try{
-    var res=await fetch(SCRIPT_URL,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({_action:'elimina',fileId:rapCorrente.driveFileId})});
+    var res=await apiFetch(SCRIPT_URL,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({_action:'elimina',fileId:rapCorrente.driveFileId})});
     var d=await res.json();
     if(d.ok){
       showAlert('Rapportino eliminato.','ok');
@@ -365,7 +490,7 @@ async function eliminaRapportinoCorrente(){
 function mostraModale(r){el('mod-num').textContent='N. '+(r.numero||'—');el('mod-title').textContent=(r.cliente||'—')+' — '+fmtData(r.data);var rM=(r.materiali||[]).map(function(m){return'<tr><td>'+esc(m.desc)+'</td><td style="text-align:center">'+esc(m.qty)+'</td><td style="text-align:center">'+esc(m.unit)+'</td></tr>'}).join('');var rO=(r.operai||[]).map(function(o){return'<tr><td>'+esc(o.nome)+'</td><td style="text-align:right">'+fmt(o.oreLav||0)+'</td><td style="text-align:right">'+fmt(o.oreStr||0)+'</td><td style="text-align:right">'+fmt(o.oreSab||0)+'</td><td style="text-align:right">'+fmt(o.oreFest||0)+'</td><td style="text-align:right">'+fmt(o.oreViag||0)+'</td></tr>'}).join('');var h='<div class="info-grid">'+'<div class="info-cell">Cliente<strong>'+esc(r.cliente||'—')+'</strong></div>'+'<div class="info-cell">N. Commessa<strong>'+esc(r.commessa||'—')+'</strong></div>'+'<div class="info-cell">Data<strong>'+fmtData(r.data)+'</strong></div>'+'<div class="info-cell">Tecnico<strong>'+esc(r.tecnico||'—')+'</strong></div>'+'<div class="info-cell">Tipo<strong>'+esc(r.tipo||'—')+'</strong></div>'+'<div class="info-cell">Avanzamento<strong>'+(parseInt(r.stato)||0)+'%</strong></div>'+'<div class="info-cell">Indirizzo<strong>'+esc(r.indirizzo||'—')+'</strong></div></div>';if(r.descrizione)h+='<div class="modal-section"><div class="sec-title">Descrizione</div><div class="note-box">'+esc(r.descrizione)+'</div></div>';if(rM)h+='<div class="modal-section"><div class="sec-title">Materiali</div><table><thead><tr><th>Materiale</th><th style="text-align:center">Qty</th><th style="text-align:center">Unità</th></tr></thead><tbody>'+rM+'</tbody></table></div>';if(rO)h+='<div class="modal-section"><div class="sec-title">Operai e ore</div><table><thead><tr><th>Operaio</th><th style="text-align:right">Ord.</th><th style="text-align:right">Str.</th><th style="text-align:right">Sab.</th><th style="text-align:right">Fest.</th><th style="text-align:right">Viag.</th></tr></thead><tbody>'+rO+'</tbody></table><div class="tot-row"><span>Lav: <strong>'+fmt(r.totLav||0)+'h</strong></span><span>Str: <strong>'+fmt(r.totStr||0)+'h</strong></span><span>Sab: <strong>'+fmt(r.totSab||0)+'h</strong></span><span>Fest: <strong>'+fmt(r.totFest||0)+'h</strong></span><span>Viag: <strong>'+fmt(r.totViag||0)+'h</strong></span></div></div>';if(r.note)h+='<div class="modal-section"><div class="sec-title">Note</div><div class="note-box">'+esc(r.note)+'</div></div>';h+='<div class="modal-section"><div class="sec-title">Firme '+(r.firmato?'<span style="color:#2d6a2d">Firmato</span>':'<span style="color:#9b9a92">Non firmato</span>')+'</div><div style="display:grid;grid-template-columns:1fr 1fr;gap:24px;margin-top:8px"><div><div style="font-size:11px;color:var(--text2);margin-bottom:6px">Tecnico</div>'+(r.firme&&r.firme.tecnico?'<img src="'+r.firme.tecnico+'" style="max-width:100%;height:90px;object-fit:contain;border:1px solid var(--border);border-radius:6px;background:#fafaf8;padding:4px">':'<div style="height:90px;border:1px dashed var(--border2);border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:12px;color:var(--text3)">Non firmato</div>')+'</div><div><div style="font-size:11px;color:var(--text2);margin-bottom:6px">Cliente / Timbro</div>'+(r.firme&&r.firme.cliente?'<img src="'+r.firme.cliente+'" style="max-width:100%;height:90px;object-fit:contain;border:1px solid var(--border);border-radius:6px;background:#fafaf8;padding:4px">':'<div style="height:90px;border:1px dashed var(--border2);border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:12px;color:var(--text3)">Non firmato</div>')+'</div></div></div>';el('mod-body').innerHTML=h;el('overlay').classList.add('open');document.body.style.overflow='hidden';}
 function chiudiModale(){el('overlay').classList.remove('open');document.body.style.overflow='';rapCorrente=null}
 function stampaPdfModale(){if(!rapCorrente)return;var r=rapCorrente;var rM=(r.materiali||[]).map(function(m){return'<tr><td>'+esc(m.desc)+'</td><td style="text-align:center">'+esc(m.qty)+'</td><td style="text-align:center">'+esc(m.unit)+'</td></tr>'}).join('');var rO=(r.operai||[]).map(function(o){return'<tr><td>'+esc(o.nome)+'</td><td style="text-align:center">'+fmt(o.oreLav||0)+'</td><td style="text-align:center">'+fmt(o.oreStr||0)+'</td><td style="text-align:center">'+fmt(o.oreSab||0)+'</td><td style="text-align:center">'+fmt(o.oreFest||0)+'</td><td style="text-align:center">'+fmt(o.oreViag||0)+'</td></tr>'}).join('');var ft=r.firme&&r.firme.tecnico?'<img src="'+r.firme.tecnico+'" style="height:70px;max-width:200px;object-fit:contain;display:block;margin-top:8px">':'';var fc=r.firme&&r.firme.cliente?'<img src="'+r.firme.cliente+'" style="height:70px;max-width:200px;object-fit:contain;display:block;margin-top:8px">':'';var win=window.open('','_blank');win.document.write('<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Rapportino N.'+esc(r.numero||'')+'</title><style>body{font-family:-apple-system,sans-serif;font-size:13px;color:#1a1a18;padding:32px;max-width:800px;margin:0 auto}.hd{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:20px;padding-bottom:14px;border-bottom:2px solid #1a1a18}.az{font-size:18px;font-weight:600}.sub{font-size:12px;color:#6b6a62;margin-top:3px}.num{text-align:right}.num strong{font-size:16px;font-weight:600;display:block}.grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;margin-bottom:16px}.cell{font-size:11px;color:#6b6a62}.cell strong{display:block;font-size:13px;color:#1a1a18;font-weight:500;margin-top:2px}table{width:100%;border-collapse:collapse;font-size:12px;margin-top:8px}th{text-align:left;font-size:10px;font-weight:500;text-transform:uppercase;color:#6b6a62;padding:5px 0;border-bottom:1px solid #ccc}td{padding:6px 0;border-bottom:1px solid #eee}.sec{font-size:10px;font-weight:500;text-transform:uppercase;color:#6b6a62;margin:16px 0 6px;padding-bottom:5px;border-bottom:1px solid #eee}.note{background:#f5f4f0;border-radius:4px;padding:10px 12px;font-size:12px;color:#6b6a62;margin-top:8px}.tot{display:flex;gap:20px;justify-content:flex-end;padding:8px 0;border-top:1px solid #ccc;font-size:12px;color:#6b6a62}.tot strong{color:#1a4a7a;font-weight:600}.firme{display:grid;grid-template-columns:1fr 1fr;gap:40px;margin-top:32px}.fb{border-top:1px solid #ccc;padding-top:6px;font-size:10px;color:#9b9a92;text-transform:uppercase}</style></head><body><div class="hd"><div>'+(r.logo?'<img src="'+r.logo+'" style="height:50px;max-width:160px;object-fit:contain;display:block;margin-bottom:6px">':'')+'<div class="az">'+esc(r.azienda||'Azienda')+'</div><div class="sub">'+esc([r.piva,r.tel,r.email].filter(Boolean).join(' · '))+'</div></div><div class="num"><span style="font-size:11px">Rapportino n.</span><strong>'+esc(r.numero||'—')+'</strong><div style="font-size:12px;color:#6b6a62;margin-top:2px">'+fmtData(r.data)+'</div></div></div><div class="grid"><div class="cell">Cliente<strong>'+esc(r.cliente||'—')+'</strong></div><div class="cell">N. Commessa<strong>'+esc(r.commessa||'—')+'</strong></div><div class="cell">Indirizzo<strong>'+esc(r.indirizzo||'—')+'</strong></div><div class="cell">Tecnico<strong>'+esc(r.tecnico||'—')+'</strong></div><div class="cell">Tipo<strong>'+esc(r.tipo||'—')+'</strong></div><div class="cell">Avanzamento<strong>'+(parseInt(r.stato)||0)+'%</strong></div></div>'+(r.descrizione?'<div class="note"><strong style="display:block;font-size:10px;text-transform:uppercase;color:#9b9a92;margin-bottom:4px">Descrizione</strong>'+esc(r.descrizione)+'</div>':'')+(rM?'<div class="sec">Materiali</div><table><thead><tr><th>Materiale</th><th>Qty</th><th>Unità</th></tr></thead><tbody>'+rM+'</tbody></table>':'')+(rO?'<div class="sec">Operai e ore</div><table><thead><tr><th>Operaio</th><th>Ord.</th><th>Str.</th><th>Sab.</th><th>Fest.</th><th>Viag.</th></tr></thead><tbody>'+rO+'</tbody></table><div class="tot"><span>Lav: <strong>'+fmt(r.totLav||0)+'h</strong></span><span>Viag: <strong>'+fmt(r.totViag||0)+'h</strong></span><span>Str: <strong>'+fmt(r.totStr||0)+'h</strong></span></div>':'')+(r.note?'<div class="note"><strong style="display:block;font-size:10px;text-transform:uppercase;color:#9b9a92;margin-bottom:4px">Note</strong>'+esc(r.note)+'</div>':'')+'<div class="firme"><div class="fb">Firma tecnico'+ft+'</div><div class="fb">Firma cliente / Timbro'+fc+'</div></div></body></html>');win.document.close();setTimeout(function(){win.print()},500);segnaStampato(r.driveFileId||'');}
-function inviaMailCliente(){if(!rapCorrente)return;var dest=prompt('Indirizzo email del cliente:');if(!dest||!dest.includes('@')){alert('Email non valida.');return}fetch(SCRIPT_URL,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({_action:'sendMail',to:dest,rapportino:rapCorrente})}).then(function(r){return r.json()}).then(function(d){showAlert(d.ok?'Email inviata a '+dest:'Errore: '+(d.error||''),d.ok?'ok':'err')}).catch(function(e){showAlert('Errore: '+e.message,'err')});}
+function inviaMailCliente(){if(!rapCorrente)return;var dest=prompt('Indirizzo email del cliente:');if(!dest||!dest.includes('@')){alert('Email non valida.');return}apiFetch(SCRIPT_URL,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({_action:'sendMail',to:dest,rapportino:rapCorrente})}).then(function(r){return r.json()}).then(function(d){showAlert(d.ok?'Email inviata a '+dest:'Errore: '+(d.error||''),d.ok?'ok':'err')}).catch(function(e){showAlert('Errore: '+e.message,'err')});}
 function csvE(v){var s=String(v!=null?v:'');return s.includes(',')||s.includes('"')||s.includes('\n')?'"'+s.replace(/"/g,'""')+'"':s}
 function csvRow(){return Array.prototype.slice.call(arguments).map(csvE).join(',')}
 function esportaCSV(){if(!filtrati.length){showAlert('Nessun dato.','err');return}var lines=[csvRow('N. Rapportino','Data','Cliente','Commessa','Indirizzo','Tecnico','Tipo','Avanzamento %','Ore Lavoro','Ore Viaggio','Ore Straord.')];filtrati.forEach(function(r){lines.push(csvRow(r.numero,r.data,r.cliente,r.commessa,r.indirizzo||'',r.tecnico,r.tipo,parseInt(r.stato)||0,fmt(r.totLav||0),fmt(r.totViag||0),fmt(r.totStr||0)))});lines.push(csvRow(''));lines.push(csvRow('TOTALI','','','','','','','',fmt(filtrati.reduce(function(s,r){return s+(r.totLav||0)},0)),fmt(filtrati.reduce(function(s,r){return s+(r.totViag||0)},0)),fmt(filtrati.reduce(function(s,r){return s+(r.totStr||0)},0))));scarica(lines.join('\n'),'rapportini_'+new Date().toISOString().slice(0,10)+'.csv');}
@@ -379,7 +504,7 @@ async function reindex() {
   el('conn-dot').className = 'conn-dot spin';
   el('conn-lbl').textContent = 'Ricostruzione indice...';
   try {
-    var res = await fetch(SCRIPT_URL + '?action=reindex&_dc=' + Date.now());
+    var res = await apiFetch(SCRIPT_URL + '?action=reindex&_dc=' + Date.now());
     var d = await res.json();
     if(d.ok) {
       showAlert('✓ ' + d.msg, 'ok');
@@ -408,7 +533,7 @@ function chiudiGestioneOperai() {
 
 async function caricaOperai() {
   try {
-    var res = await fetch(SCRIPT_URL + '?action=operai&_dc=' + Date.now());
+    var res = await apiFetch(SCRIPT_URL + '?action=operai&_dc=' + Date.now());
     var d = await res.json();
     if(d.ok) { operaiLista = d.operai || []; renderOperai(); }
   } catch(e) {
@@ -448,7 +573,7 @@ function rimuoviOperaio(i) {
 
 async function salvaOperai() {
   try {
-    var res = await fetch(SCRIPT_URL, {
+    var res = await apiFetch(SCRIPT_URL, {
       method: 'POST',
       headers: {'Content-Type': 'text/plain'},
       body: JSON.stringify({_action: 'saveOperai', operai: operaiLista})
@@ -493,7 +618,7 @@ function chiudiModifica() {
 
 function popolaSelectModOperai() {
   // Carica lista operai dal server
-  fetch(SCRIPT_URL + '?action=operai&_dc=' + Date.now())
+  apiFetch(SCRIPT_URL + '?action=operai&_dc=' + Date.now())
     .then(function(r) { return r.json(); })
     .then(function(d) {
       if (!d.ok) return;
@@ -564,14 +689,14 @@ async function salvaModifica() {
   r.totStr = modOperai.reduce(function(s, o) { return s + (parseFloat(o.oreStr) || 0); }, 0);
 
   try {
-    var res = await fetch(SCRIPT_URL, {
+    var res = await apiFetch(SCRIPT_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain' },
       body: JSON.stringify(r)
     });
     var d = await res.json();
     if (d.ok) {
-      showAlert('✓ Rapportino aggiornato su Drive!', 'ok');
+      showAlert('✓ Rapportino aggiornato!', 'ok');
       rapCorrente = r;
       chiudiModifica();
       caricaDati(); // ricarica lista
