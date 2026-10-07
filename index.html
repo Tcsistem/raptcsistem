@@ -334,7 +334,7 @@ textarea{resize:vertical;min-height:80px;line-height:1.5}
     <button class="btn" onclick="apriIdee()" style="padding:6px 12px;font-size:13px;border-radius:20px">💡 Idee</button>
     <div class="conn-pill">
       <div class="dot" id="dot"></div>
-      <span id="conn-lbl">Drive</span>
+      <span id="conn-lbl">Server</span>
     </div>
   </div>
 </div>
@@ -362,7 +362,7 @@ textarea{resize:vertical;min-height:80px;line-height:1.5}
       <div class="fg"><label>Data</label><input type="date" id="f-data"></div>
       <div class="fg"><label>Cliente / Azienda</label><input type="text" id="f-cliente" placeholder="Ragione sociale"></div>
       <div class="fg" style="position:relative">
-        <label>N. offerta facoltativo </label>
+        <label>N. Commessa <span style="color:var(--text2);font-weight:400">(facoltativo)</span></label>
         <input type="text" id="f-commessa" placeholder="es. C-2025-042" autocomplete="off"
          >
       </div>
@@ -502,7 +502,7 @@ textarea{resize:vertical;min-height:80px;line-height:1.5}
 <div id="tab-sync" class="section">
   <div class="card">
     <div class="card-head">
-      <span>Sincronizzazione Google Drive</span>
+      <span>Sincronizzazione con il server</span>
       <button class="btn" style="padding:7px 14px;font-size:13px" onclick="testConn()">Verifica</button>
     </div>
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
@@ -599,13 +599,140 @@ textarea{resize:vertical;min-height:80px;line-height:1.5}
     <div class="actions" style="margin-top:8px">
       <button class="btn" onclick="chiudiFirma()">Annulla</button>
       <button class="btn btn-blue" onclick="stampaPdfFirma()">🖨️ Stampa / PDF</button>
-      <button class="btn btn-primary" onclick="firmaESalva()">✓ Salva e invia su Drive</button>
+      <button class="btn btn-primary" onclick="firmaESalva()">✓ Salva e invia</button>
     </div>
   </div>
 </div>
 
 <script>
-const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxwM3SXUM9GioLOcnFoYGwj6lk7JMhwnVvcUW-IwqE_nrd_vZjHApdijXwXHcZSAG2s/exec';
+// ═══ CONNESSIONE AL DATABASE (Supabase) ═══════════════════════════
+const SB_URL = 'https://unytdhjxgbspchydgure.supabase.co';     // es. https://abcdefgh.supabase.co
+const SB_KEY = 'sb_publishable_ruAKvyaspLMpSy18ZA5oyw_Yu5JxGc6';      // chiave "anon" / "publishable" (è pubblica per progetto)
+// (l'email del responsabile serve solo alla dashboard)
+const DASH_EMAIL = 'amministrazione@tcsistem.it';
+const SCRIPT_URL = SB_URL;
+var sbSess = null;
+try { sbSess = JSON.parse(sessionStorage.getItem('sb_sess') || 'null'); } catch(e) {}
+function sbSalvaSess(s) { sbSess = s; try { if (s) sessionStorage.setItem('sb_sess', JSON.stringify(s)); else sessionStorage.removeItem('sb_sess'); } catch(e) {} }
+async function sbRaw(path, o) {
+  o = o || {};
+  var h = { 'apikey': SB_KEY, 'Content-Type': 'application/json' };
+  if (o.token) h['Authorization'] = 'Bearer ' + o.token;
+  else if (SB_KEY.indexOf('eyJ') === 0) h['Authorization'] = 'Bearer ' + SB_KEY;
+  for (var k in (o.headers || {})) h[k] = o.headers[k];
+  var res = await fetch(SB_URL + path, { method: o.method || 'GET', headers: h, signal: o.signal,
+    body: o.body !== undefined ? JSON.stringify(o.body) : undefined });
+  var txt = await res.text(), data = null;
+  try { data = txt ? JSON.parse(txt) : null; } catch(e) {}
+  if (!res.ok) {
+    var err = new Error((data && (data.message || data.msg || data.error_description || data.error)) || ('errore ' + res.status));
+    err.http = true; err.status = res.status; throw err;
+  }
+  return data;
+}
+async function sbToken() {
+  if (!sbSess) return null;
+  if (sbSess.expires_at - 60 > Date.now() / 1000) return sbSess.access_token;
+  try {
+    var d = await sbRaw('/auth/v1/token?grant_type=refresh_token', { method: 'POST', body: { refresh_token: sbSess.refresh_token } });
+    sbSalvaSess({ access_token: d.access_token, refresh_token: d.refresh_token, expires_at: d.expires_at || (Date.now() / 1000 + d.expires_in) });
+    return sbSess.access_token;
+  } catch(e) { if (e.http) sbSalvaSess(null); throw e; }
+}
+async function sbLogin(password) {
+  var d = await sbRaw('/auth/v1/token?grant_type=password', { method: 'POST', body: { email: DASH_EMAIL, password: password } });
+  sbSalvaSess({ access_token: d.access_token, refresh_token: d.refresh_token, expires_at: d.expires_at || (Date.now() / 1000 + d.expires_in) });
+}
+async function sbApi(path, o) { o = o || {}; o.token = await sbToken(); return sbRaw(path, o); }
+function sbRpc(nome, args, o) { o = o || {}; o.method = 'POST'; o.body = args || {}; return sbApi('/rest/v1/rpc/' + nome, o); }
+var sbCfg = null;
+async function sbConfig() {
+  if (sbCfg) return sbCfg;
+  var righe = await sbApi('/rest/v1/impostazioni?select=chiave,valore'), c = {};
+  righe.forEach(function(r) { c[r.chiave] = r.valore; });
+  sbCfg = { azienda: c.azienda || '', piva: c.piva || '', tel: c.tel || '', email: c.email || '', logo: c.logo || '' };
+  return sbCfg;
+}
+async function sbOperai() {
+  var righe = await sbApi('/rest/v1/operai?select=nome&order=pos.asc,id.asc');
+  return righe.map(function(r) { return r.nome; });
+}
+function sbRiga(x) {
+  return { fileId: String(x.id), numero: x.numero || '', data: x.data || '', cliente: x.cliente || '', commessa: String(x.commessa || ''),
+    tecnico: x.tecnico || '', tipo: x.tipo || '', stato: x.stato || '0',
+    totLav: Number(x.tot_lav) || 0, totStr: Number(x.tot_str) || 0, totSab: Number(x.tot_sab) || 0,
+    totFest: Number(x.tot_fest) || 0, totViag: Number(x.tot_viag) || 0, firmato: !!x.firmato };
+}
+async function sbMail(corpo) {
+  var tok = await sbToken();
+  var h = { 'apikey': SB_KEY, 'Content-Type': 'application/json' };
+  if (tok) h['Authorization'] = 'Bearer ' + tok;
+  var res = await fetch(SB_URL + '/functions/v1/rapportini-mail', { method: 'POST', headers: h, body: JSON.stringify(corpo) });
+  var d = null; try { d = await res.json(); } catch(e) {}
+  if (!res.ok || !d || !d.ok) { var er = new Error((d && d.error) || ('errore ' + res.status)); er.http = true; throw er; }
+  return d;
+}
+// Gestisce le richieste dell'app come faceva il vecchio server: stesse azioni, stesse risposte.
+async function sbGestisci(url, opts) {
+  var q = new URLSearchParams(url.indexOf('?') >= 0 ? url.substring(url.indexOf('?') + 1) : '');
+  var azione = q.get('action') || '', post = null;
+  if (opts && opts.body) { try { post = JSON.parse(opts.body); } catch(e) {} }
+  var sig = opts && opts.signal;
+  if (post) {
+    if (post._action === 'saveOperai') { await sbRpc('rap_salva_operai', { nomi: post.operai || [] }); return { ok: true }; }
+    if (post._action === 'elimina') {
+      var del = await sbApi('/rest/v1/rapportini?id=eq.' + String(post.fileId || '').replace(/\D/g, ''), { method: 'DELETE', headers: { 'Prefer': 'return=representation' } });
+      if (!del || !del.length) return { ok: false, error: 'Rapportino non trovato o accesso non autorizzato' };
+      return { ok: true };
+    }
+    if (post._action === 'verifica') {
+      var pres = await sbRpc('rap_verifica', { numeri: post.numeri || [] }, { signal: sig });
+      return { ok: true, rapportini: (pres || []).map(function(n) { return { numero: n }; }) };
+    }
+    if (post._action === 'sendMail') { await sbMail({ tipo: 'cliente', to: post.to, rapportino: post.rapportino }); return { ok: true }; }
+    if (post._action === 'sendIdea') { await sbMail({ tipo: 'idea', nome: post.nome, testo: post.testo }); return { ok: true }; }
+    return await sbRpc('rap_salva', { r: post }, { signal: sig });
+  }
+  if (azione === 'ping') { await sbConfig(); return { ok: true, msg: 'Database collegato' }; }
+  if (azione === 'config') { var c = await sbConfig(); var o = await sbOperai(); return Object.assign({ ok: true, operai: o }, c); }
+  if (azione === 'nextnum') { return { ok: true, numero: await sbRpc('rap_next_numero') }; }
+  if (azione === 'operai') { return { ok: true, operai: await sbOperai() }; }
+  if (azione === 'reindex') { return { ok: true, msg: 'Non serve: i dati sono in un database SQL.' }; }
+  if (azione === 'list') {
+    var tutti = [], da = 0, passo = 1000;
+    while (true) {
+      var pag = await sbApi('/rest/v1/rapportini?select=id,numero,data,cliente,commessa,tecnico,tipo,stato,tot_lav,tot_str,tot_sab,tot_fest,tot_viag,firmato&order=data.desc.nullslast,id.desc',
+        { headers: { 'Range-Unit': 'items', 'Range': da + '-' + (da + passo - 1) } });
+      tutti = tutti.concat(pag);
+      if (pag.length < passo) break;
+      da += passo;
+    }
+    return { ok: true, rapportini: tutti.map(sbRiga) };
+  }
+  if (azione === 'get') {
+    var id = String(q.get('fileId') || '').replace(/\D/g, '');
+    if (!id) return { ok: false, error: 'fileId non valido' };
+    var rr = await sbApi('/rest/v1/rapportini?id=eq.' + id + '&select=*');
+    if (!rr.length) return { ok: false, error: 'Rapportino non trovato' };
+    var x = rr[0], cf = await sbConfig();
+    return { ok: true, rapportino: Object.assign({ id: x.client_id || String(x.id), numero: x.numero || '', data: x.data || '', cliente: x.cliente || '',
+      commessa: String(x.commessa || ''), indirizzo: x.indirizzo || '', tecnico: x.tecnico || '', tipo: x.tipo || '', stato: x.stato || '0',
+      descrizione: x.descrizione || '', note: x.note || '', totLav: Number(x.tot_lav) || 0, totStr: Number(x.tot_str) || 0, totSab: Number(x.tot_sab) || 0,
+      totFest: Number(x.tot_fest) || 0, totViag: Number(x.tot_viag) || 0, materiali: x.materiali || [], operai: x.operai || [], firme: x.firme || {},
+      firmato: !!x.firmato, syncedAt: x.synced_at || '', createdAt: x.created_at || '', driveFileId: String(x.id) }, cf) };
+  }
+  return { ok: false, error: 'azione sconosciuta' };
+}
+// Sostituisce fetch(SCRIPT_URL…) nel resto dell'app: restituisce un oggetto "come una risposta di rete"
+async function apiFetch(url, opts) {
+  var d;
+  try { d = await sbGestisci(url, opts); }
+  catch(e) { if (e && e.http) d = { ok: false, error: e.message }; else throw e; }
+  var txt = JSON.stringify(d);
+  return { ok: true, status: 200, text: async function() { return txt; }, json: async function() { return d; } };
+}
+// ═══════════════════════════════════════════════════════════════════
+
 
 // ── STORAGE POLYFILL ───────────────────────────────────
 (function(){
@@ -653,7 +780,7 @@ function fmt(n){n=Number(n)||0;return n%1===0?n:n.toFixed(1)}
 // ── CONFIG ────────────────────────────────────────────
 async function caricaConfig(){
   try{
-    const res=await fetch(SCRIPT_URL+'?action=config&_dc='+Date.now());
+    const res=await apiFetch(SCRIPT_URL+'?action=config&_dc='+Date.now());
     const d=await res.json();
     if(d.ok){cfg=d;operaiPred=d.operai||[];renderInfoCfg();setDot('ok');var s=el('info-stato');if(s)s.textContent='Connesso';popolaSelectOperai();}
   }catch(e){
@@ -720,7 +847,7 @@ async function autoNum(){
   var n=el('f-num');
   if(n&&!n.value){
     try{
-      var res=await fetch(SCRIPT_URL+'?action=nextnum&_dc='+Date.now());
+      var res=await apiFetch(SCRIPT_URL+'?action=nextnum&_dc='+Date.now());
       var d=await res.json();
       if(d.ok && d.numero) n.value=d.numero;
       else{var y=new Date().getFullYear();n.value=y+'-'+String(rapportini.length+1).padStart(3,'0');}
@@ -1164,7 +1291,7 @@ function mostraAnteprima(){
 async function testConn(){
   setDot('spin');
   try{
-    var res=await fetch(SCRIPT_URL+'?action=ping&_dc='+Date.now());
+    var res=await apiFetch(SCRIPT_URL+'?action=ping&_dc='+Date.now());
     var d=await res.json();
     if(d.ok){setDot('ok');showAlert(d.msg,'ok');var s=el('info-stato');if(s)s.textContent='Connesso'}
     else{setDot('err');showAlert('Errore: '+(d.error||''),'err')}
@@ -1178,7 +1305,7 @@ async function uploadDrive(r){
   try{
     var opts={method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify(r,function(k,v){return k==='logo'?undefined:v})};
     if(ctrl)opts.signal=ctrl.signal;
-    var res=await fetch(SCRIPT_URL,opts);
+    var res=await apiFetch(SCRIPT_URL,opts);
     var txt=await res.text();
     var d;
     try{d=JSON.parse(txt)}catch(pe){
@@ -1307,7 +1434,7 @@ async function verificaInvii(){
   if(!inv.length)return;
   showAlert('Verifica in corso…','info');
   try{
-    var res=await fetch(SCRIPT_URL+'?action=list&_dc='+Date.now());
+    var res=await apiFetch(SCRIPT_URL,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({_action:'verifica',numeri:inv.map(function(r){return String(r.numero)})})});
     var d=await res.json();
     if(!d.ok)throw new Error(d.error||'errore');
     var presenti={};
@@ -1339,7 +1466,7 @@ function renderSync(){
   var w=el('sync-list');
   if(!rapportini.length){w.innerHTML='<div class="empty">Nessun rapportino salvato.</div>';return}
   w.innerHTML=rapportini.map(function(r){
-    var st=r.syncedNas?'<span style="font-size:12px;color:var(--green)">✓ Drive</span>':'<span style="font-size:12px;color:var(--amber)">Non inviato</span>';
+    var st=r.syncedNas?'<span style="font-size:12px;color:var(--green)">✓ Inviato</span>':'<span style="font-size:12px;color:var(--amber)">Non inviato</span>';
     return'<div class="sync-item">'+
       '<div style="flex:1"><div style="font-weight:500">'+esc(r.numero)+' — '+esc(r.cliente||'N/A')+'</div>'+
       '<div style="font-size:12px;color:var(--text2)">'+(r.data||'—')+' · '+esc(r.tecnico||'—')+'</div></div>'+
@@ -1490,7 +1617,7 @@ async function inviaIdea(){
   var testo=(el('idee-testo').value||'').trim();
   if(!testo){showAlert('Scrivi un messaggio prima di inviare.','err');return;}
   try{
-    var res=await fetch(SCRIPT_URL,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({_action:'sendIdea',nome:nome,testo:testo})});
+    var res=await apiFetch(SCRIPT_URL,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({_action:'sendIdea',nome:nome,testo:testo})});
     chiudiIdee();
     showToastCenter('Idea inviata!\nGrazie per il suggerimento!','💡');
   }catch(e){showAlert('Errore invio: '+e.message,'err');}
