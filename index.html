@@ -362,7 +362,7 @@ textarea{resize:vertical;min-height:80px;line-height:1.5}
       <div class="fg"><label>Data</label><input type="date" id="f-data"></div>
       <div class="fg"><label>Cliente / Azienda</label><input type="text" id="f-cliente" placeholder="Ragione sociale"></div>
       <div class="fg" style="position:relative">
-        <label>N. Commessa <span style="color:var(--red)">*</span></label>
+        <label>N. offerta facoltativo </label>
         <input type="text" id="f-commessa" placeholder="es. C-2025-042" autocomplete="off"
          >
       </div>
@@ -1016,7 +1016,6 @@ function resetForm(){
   renderMat();renderOp();setToday();autoNum();window.scrollTo(0,0);
 }
 function validaBase(){
-  if(!v('f-commessa')){showAlert('N. Commessa obbligatorio.','err');el('f-commessa').focus();return false}
   if(!v('f-tecnico')){showAlert('Tecnico responsabile obbligatorio.','err');el('f-tecnico').focus();return false}
   return true;
 }
